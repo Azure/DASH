@@ -2,6 +2,10 @@ from sai_thrift.sai_headers import *
 from sai_base_test import *
 from p4_dash_utils import *
 
+TEST_TIMEOUT = 1
+SPARE_TIME = 2
+TEST_TIMEOUT_MILLI = TEST_TIMEOUT * 1000
+
 @use_flow
 class SaiThriftDpappPktTest(SaiHelperSimplified):
     """ Test saithrift vnet outbound towards dpapp"""
@@ -116,6 +120,19 @@ class SaiThriftDpappPktTest(SaiHelperSimplified):
                                          full_flow_resimulation_requested=False,
                                          max_resimulated_flow_per_second=0,
                                          outbound_routing_group_id=self.outbound_routing_group)
+
+        self.flow_table = sai_thrift_create_flow_table(self.client,
+                    max_flow_count=128,
+                    dash_flow_enabled_key = SAI_DASH_FLOW_ENABLED_KEY_ENI_MAC
+                                           |SAI_DASH_FLOW_ENABLED_KEY_VNI
+                                           |SAI_DASH_FLOW_ENABLED_KEY_PROTOCOL
+                                           |SAI_DASH_FLOW_ENABLED_KEY_SRC_IP
+                                           |SAI_DASH_FLOW_ENABLED_KEY_DST_IP
+                                           |SAI_DASH_FLOW_ENABLED_KEY_SRC_PORT
+                                           |SAI_DASH_FLOW_ENABLED_KEY_DST_PORT,
+                    flow_ttl_in_milliseconds=TEST_TIMEOUT_MILLI)
+        assert (self.flow_table != SAI_NULL_OBJECT_ID)
+        # sai_thrift_set_eni_attribute(self.client, eni_oid = self.eni, flow_table_id=self.flow_table)
 
         self.eam = sai_thrift_eni_ether_address_map_entry_t(switch_id=self.switch_id, address = self.eni_mac)
         status = sai_thrift_create_eni_ether_address_map_entry(self.client,
@@ -289,11 +306,66 @@ class SaiThriftDpappPktTest(SaiHelperSimplified):
 
         print(f"{self.__class__.__name__} trafficTcpTest OK\n")
 
+    def ageoutTcpTest(self):
+
+        src_vm_ip = "10.1.1.11"
+        outer_smac = "00:00:05:06:06:07"
+        tcp_src_port = 0x1234
+        tcp_dst_port = 0x50
+
+        # customer packet: tcp SYN
+        inner_pkt = simple_tcp_packet(eth_dst="02:02:02:02:02:02",
+                                      eth_src=self.eni_mac,
+                                      ip_dst=self.dst_ca_ip,
+                                      ip_src=src_vm_ip,
+                                      tcp_sport=tcp_src_port,
+                                      tcp_dport=tcp_dst_port,
+                                      tcp_flags="S")
+        vxlan_pkt = simple_vxlan_packet(eth_dst=self.our_mac,
+                                        eth_src=outer_smac,
+                                        ip_dst=self.vip,
+                                        ip_src=self.src_vm_pa_ip,
+                                        udp_sport=11638,
+                                        with_udp_chksum=False,
+                                        vxlan_vni=self.outbound_vni,
+                                        inner_frame=inner_pkt)
+
+        inner_exp_pkt = simple_tcp_packet(eth_dst=self.dst_ca_mac,
+                                        eth_src=self.eni_mac,
+                                        ip_dst=self.dst_ca_ip,
+                                        ip_src=src_vm_ip,
+                                        tcp_sport=tcp_src_port,
+                                        tcp_dport=tcp_dst_port,
+                                        tcp_flags="S")
+        vxlan_exp_pkt = simple_vxlan_packet(eth_dst="00:00:00:00:00:00",
+                                        eth_src="00:00:00:00:00:00",
+                                        ip_dst=self.dst_pa_ip,
+                                        ip_src=self.vip,
+                                        udp_sport=0, # TODO: Fix sport in pipeline
+                                        with_udp_chksum=False,
+                                        vxlan_vni=self.vnet_vni,
+                                        inner_frame=inner_exp_pkt)
+
+        self.pkt_exp = vxlan_exp_pkt
+        print("\tSending outbound packet TCP SYN ...")
+        send_packet(self, 0, vxlan_pkt)
+        print("\tVerifying packet...")
+        verify_packet(self, self.pkt_exp, 0)
+        print("\tVerifying flow created...")
+        verify_flow(self.eni_mac, self.vnet & 0xffff, inner_pkt)
+        time.sleep(TEST_TIMEOUT + SPARE_TIME)
+        print("\tVerifying flow aged out...")
+        verify_no_flow(self.eni_mac, self.vnet & 0xffff, inner_pkt)
+        
+
+        print(f"{self.__class__.__name__} ageoutTcpTest OK\n")    
+
     def runTest(self):
 
         self.configureVnet()
         self.trafficUdpTest()
         self.trafficTcpTest()
+        self.ageoutTcpTest()
 
     def tearDown(self):
 
